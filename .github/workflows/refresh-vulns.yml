@@ -1,0 +1,49 @@
+name: Refresh vulnerability reports
+
+# Golden images live for months; new CVEs keep being published against the
+# same, unchanged images. This re-scans every mirrored SBOM daily with a fresh
+# grype DB and rewrites the .vuln.json reports whose DB is now newer. Runs in
+# this public repo, so Actions minutes are free, and pushes with the built-in
+# GITHUB_TOKEN — no PAT needed.
+
+on:
+  schedule:
+    - cron: '17 3 * * *'   # daily, 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      vuln_force:
+        description: 'Overwrite every report regardless of its DB build date'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: refresh-vulns
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      GRYPE_VERSION: "0.116.0"   # keep in sync with image-builder scripts/vuln-pipeline.sh
+      VULN_FORCE: ${{ github.event.inputs.vuln_force || 'false' }}
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+
+      - name: Install pinned grype
+        run: |
+          curl -sSfL "https://github.com/anchore/grype/releases/download/v${GRYPE_VERSION}/grype_${GRYPE_VERSION}_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin grype
+          grype version
+
+      - name: Update grype vulnerability DB
+        run: grype db update
+
+      - name: Re-scan SBOMs and commit refreshed reports
+        env:
+          RUN_COMMIT: "1"
+        run: bash bin/refresh-vulns.sh
