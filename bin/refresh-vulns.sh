@@ -20,6 +20,30 @@ log() { echo "[refresh] $*"; }
 db_built() { jq -r '(.descriptor.db.built // .descriptor.db.status.built // "")' "$1" 2>/dev/null || echo ""; }
 to_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
 
+# Portal projection — MUST match image-builder scripts/vuln-pipeline.sh so
+# build-time and scheduled reports are byte-comparable. Keeps exactly the
+# portal-contract fields plus grype/DB versions, and normalizes the DB build
+# time to descriptor.db.built (grype v6 nests it under db.status.built).
+VULN_PROJECT='{
+  descriptor: {
+    name: .descriptor.name, version: .descriptor.version,
+    timestamp: .descriptor.timestamp,
+    db: {
+      built: (.descriptor.db.built // .descriptor.db.status.built),
+      schemaVersion: (.descriptor.db.schemaVersion // .descriptor.db.status.schemaVersion)
+    }
+  },
+  matches: [.matches[] | {
+    vulnerability: {
+      id: .vulnerability.id, severity: .vulnerability.severity,
+      fix: {versions: (.vulnerability.fix.versions // []), state: .vulnerability.fix.state},
+      cvss: (.vulnerability.cvss // []), urls: (.vulnerability.urls // []),
+      dataSource: .vulnerability.dataSource
+    },
+    artifact: {name: .artifact.name, version: .artifact.version, type: .artifact.type}
+  }]
+}'
+
 changed=0
 scanned=0
 db_date_seen=""
@@ -29,14 +53,17 @@ while IFS= read -r -d '' sbom; do
   vuln="${sbom%.spdx.json}.vuln.json"
   tmp=$(mktemp)
 
-  if ! grype "sbom:${sbom}" -o json > "$tmp" 2>/dev/null; then
+  raw=$(mktemp)
+  if ! grype "sbom:${sbom}" -o json > "$raw" 2>/dev/null; then
     log "WARNING: grype failed on ${sbom} — leaving existing report untouched"
-    rm -f "$tmp"; continue
+    rm -f "$tmp" "$raw"; continue
   fi
-  if ! jq -e '.descriptor and (.matches | type == "array")' "$tmp" >/dev/null 2>&1; then
+  if ! jq -e '.descriptor and (.matches | type == "array")' "$raw" >/dev/null 2>&1; then
     log "WARNING: invalid grype output for ${sbom} — skipping"
-    rm -f "$tmp"; continue
+    rm -f "$tmp" "$raw"; continue
   fi
+  jq -c "$VULN_PROJECT" "$raw" > "$tmp"
+  rm -f "$raw"
 
   new_built=$(db_built "$tmp")
   [[ -n "$new_built" ]] && db_date_seen="${new_built%%T*}"
