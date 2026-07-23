@@ -21,7 +21,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: refresh-vulns
+  group: mirror-maintenance   # shared with prune-orphans so they never race
   cancel-in-progress: false
 
 jobs:

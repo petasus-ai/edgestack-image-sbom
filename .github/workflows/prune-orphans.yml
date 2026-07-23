@@ -1,0 +1,38 @@
+name: Prune orphaned reports
+
+# SBOMs are immutable, so every rebuild leaves the previous digest's files
+# behind. This keeps only the digests still referenced by a live quay tag,
+# bounding both the working tree and the daily re-scan set. Runs in this public
+# repo with the built-in GITHUB_TOKEN — no PAT.
+
+on:
+  schedule:
+    - cron: '30 4 * * 0'   # weekly, Sunday 04:30 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'List orphans without deleting anything'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-maintenance   # shared with refresh-vulns so they never race
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    env:
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+    steps:
+      - name: Checkout mirror
+        uses: actions/checkout@v4
+
+      - name: Prune orphaned SBOM/vuln reports
+        env:
+          RUN_COMMIT: "1"
+        run: bash bin/prune-orphans.sh

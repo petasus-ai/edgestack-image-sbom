@@ -40,3 +40,20 @@ Reports are produced two ways, both applying the same newer-DB update gate:
   pushes with the built-in `GITHUB_TOKEN`.
 
 Do not edit either file type manually.
+
+## Retention
+
+SBOMs are immutable, so a rebuilt tag moves to a new digest and the previous
+digest's files become orphans that would otherwise accumulate forever.
+`.github/workflows/prune-orphans.yml` (weekly + `workflow_dispatch`, with a
+`dry_run` input) runs `bin/prune-orphans.sh`, which lists each repository's
+active tags via the public quay API and removes the `.spdx.json`/`.vuln.json`
+of any digest no longer referenced by a live tag. This bounds both the working
+tree and the daily re-scan set to the digests currently on quay. It is safe by
+construction: if the quay API for a repository fails or returns no digests,
+that directory is skipped untouched, so a transient error can never delete
+valid files. It keeps any digest a live tag points at, regardless of which
+branch (master or cilium) built it.
+
+The two maintenance workflows share a `mirror-maintenance` concurrency group so
+the daily re-scan and the weekly prune never run against the tree at once.
