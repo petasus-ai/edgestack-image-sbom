@@ -21,9 +21,18 @@ db_built() { jq -r '(.descriptor.db.built // .descriptor.db.status.built // "")'
 to_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
 
 # Portal projection — MUST match image-builder scripts/vuln-pipeline.sh so
-# build-time and scheduled reports are byte-comparable. Keeps exactly the
+# build-time and scheduled reports stay schema-identical. Keeps exactly the
 # portal-contract fields plus grype/DB versions, and normalizes the DB build
 # time to descriptor.db.built (grype v6 nests it under db.status.built).
+#
+# Two lookups parameterize it. $av (distro fix availability) is always {}
+# here — the refresh does not run distro-fix-check.sh, so those fields are
+# null, the contract's "not judged". $vend is built per SBOM below:
+# artifact.vendored marks a bundled copy (setuptools/_vendor/), judged from
+# the SBOM's sourceInfo because grype reconstructs no locations from SPDX —
+# a version is vendored only when EVERY SBOM entry for it sits under
+# _vendor/, so a stale bundle next to a properly installed copy keeps the
+# real one actionable.
 VULN_PROJECT='{
   descriptor: {
     name: .descriptor.name, version: .descriptor.version,
@@ -33,14 +42,20 @@ VULN_PROJECT='{
       schemaVersion: (.descriptor.db.schemaVersion // .descriptor.db.status.schemaVersion)
     }
   },
-  matches: [.matches[] | {
+  matches: [.matches[] |
+    ($av[.artifact.name + "|" + ((.vulnerability.fix.versions // []) | join(","))]) as $d | {
     vulnerability: {
       id: .vulnerability.id, severity: .vulnerability.severity,
-      fix: {versions: (.vulnerability.fix.versions // []), state: .vulnerability.fix.state},
+      fix: {
+        versions: (.vulnerability.fix.versions // []), state: .vulnerability.fix.state,
+        availableInDistro: (if $d == null then null else $d.availableInDistro end),
+        distroLatest: (if $d == null then null else $d.distroLatest end)
+      },
       cvss: (.vulnerability.cvss // []), urls: (.vulnerability.urls // []),
       dataSource: .vulnerability.dataSource
     },
-    artifact: {name: .artifact.name, version: .artifact.version, type: .artifact.type}
+    artifact: {name: .artifact.name, version: .artifact.version, type: .artifact.type,
+      vendored: ($vend[.artifact.name + "|" + .artifact.version] // false)}
   }]
 }'
 
@@ -62,7 +77,14 @@ while IFS= read -r -d '' sbom; do
     log "WARNING: invalid grype output for ${sbom} — skipping"
     rm -f "$tmp" "$raw"; continue
   fi
-  jq -c "$VULN_PROJECT" "$raw" > "$tmp"
+  # name|version → bundled-copy judgment for artifact.vendored (see
+  # VULN_PROJECT). Fails soft to {} — every finding then stays vendored:false.
+  vend=$(jq -c '[.packages[]? | select(.sourceInfo)
+      | {k: (.name + "|" + (.versionInfo // "")), v: (.sourceInfo | contains("/_vendor/"))}]
+    | group_by(.k) | map({key: .[0].k, value: (map(.v) | all)}) | from_entries' "$sbom" 2>/dev/null || echo '{}')
+  echo "$vend" | jq -e 'type == "object"' >/dev/null 2>&1 || vend='{}'
+
+  jq -c --argjson av '{}' --argjson vend "$vend" "$VULN_PROJECT" "$raw" > "$tmp"
   rm -f "$raw"
 
   new_built=$(db_built "$tmp")
