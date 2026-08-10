@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Upgrade-freeze policy per image repository, read by bin/refresh-vulns.sh to set",
+    "artifact.frozen on each finding. A frozen package is one the image pins in place,",
+    "so a fix existing in the repos does NOT make the finding patchable on a running",
+    "node — the supported remediation is rebuilding the golden image, and the portal",
+    "must not count it as actionable.",
+    "",
+    "This file exists because the mirror is shared by several builders whose freeze",
+    "policies genuinely differ, so there is no correct global regex. Each builder owns",
+    "one entry, copied from the FREEZE_MARKER_REGEX / FREEZE_PKG_REGEX pair in its own",
+    "scripts/supply-chain.conf — the same two values its build-time vuln-pipeline.sh",
+    "uses, so a report refreshed here matches the one published at build time.",
+    "",
+    "markerRegex identifies a frozen IMAGE from its SBOM: the freeze role only runs",
+    "where the accelerator stack is installed, so the driver's presence is the policy",
+    "bit. The daily re-scan walks SBOMs by digest and has no tag to consult.",
+    "pkgRegex names the packages the freeze covers.",
+    "",
+    "repoRegex is matched against the mirror directory name; the first entry that",
+    "matches wins. A repository matching no entry gets frozen:false on every finding,",
+    "which is the behaviour this file replaced — so a builder that has no freeze policy",
+    "(or has not added itself yet) is unaffected by its existence.",
+    "",
+    "Keep each entry in sync with its builder's supply-chain.conf. Drift shows up as a",
+    "build-time report and a refreshed report disagreeing about the same digest."
+  ],
+  "policies": [
+    {
+      "builder": "petasus-ai/edgestack-image-builder",
+      "source": "scripts/supply-chain.conf",
+      "repoRegex": "-container-disk$",
+      "markerRegex": "^(nvidia-open|nvidia-driver|nvidia-dkms|kmod-nvidia|mlnx-ofa)",
+      "pkgRegex": "^(linux-(image|headers|modules|generic)|kernel($|-)|nvidia-|libnvidia-|xserver-xorg-video-nvidia|cuda-|libnccl|libnvshmem|libnvtoolsext|datacenter-gpu-manager-|gdrcopy|gdrdrv-dkms$|libgdrapi|doca-|mlnx-|ofed-|rdma-core|libibverbs|librdmacm|ibverbs-|infiniband-diags$|perftest$|ucx($|-)|lustre|vastnfs|dkms$|gcc($|-)|make$|libelf-dev$|elfutils-libelf-devel$)"
+    }
+  ]
+}

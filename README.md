@@ -41,6 +41,37 @@ Reports are produced two ways, both applying the same newer-DB update gate:
 
 Do not edit either file type manually.
 
+## Actionability fields
+
+Three projected fields tell the portal that a finding is real but **not**
+patchable with a plain `dnf update` / `apt upgrade`, so it must not be counted
+as actionable. The daily re-scan has to reproduce all three, or it re-grades
+every image the moment it overwrites the build-time report:
+
+- **`vulnerability.fix.availableInDistro`** / **`distroLatest`** — is the fix
+  grype cites actually published by this distro yet? grype has no Rocky/Alma
+  feed and matches EL clones against Red Hat's, which is right about whether a
+  CVE applies and wrong about the fix existing: Rocky rebuilds Red Hat's errata
+  days-to-weeks later. `bin/distro-fix-check.sh` reads the distro's own package
+  index and answers it. The file is a **verbatim copy** of the builder's
+  `scripts/distro-fix-check.sh` so the two stay diffable; `DISTRO_FIX_ARCH`
+  (derived here from the SBOM's purl qualifiers, since this job runs on x86_64
+  runners and half the mirrored SBOMs are aarch64) and `DISTRO_FIX_CACHE_DIR`
+  (one index read per family/release/arch instead of per SBOM) are the only
+  knobs the refresh sets.
+- **`artifact.vendored`** — a copy bundled inside another package (a `_vendor/`
+  path). Judged from the SBOM's `sourceInfo`, and only when *every* entry for
+  that version is vendored, so a stale bundle beside a real install keeps the
+  real one actionable.
+- **`artifact.frozen`** — a package the image's upgrade-freeze policy pins in
+  place. The fix may exist, but applying it on a running node is unsupported;
+  the remediation is a rebuild. Policy lives in `bin/freeze-policy.json`, keyed
+  by image repository, because the builders sharing this mirror do not have the
+  same freeze list — one global regex would be wrong for all of them. A
+  repository with no entry gets `frozen:false` everywhere, so a builder that
+  has not added itself is unaffected. Each entry is copied from that builder's
+  `scripts/supply-chain.conf` and must be kept in sync with it.
+
 ## Retention
 
 SBOMs are immutable, so a rebuilt tag moves to a new digest and the previous

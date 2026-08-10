@@ -25,14 +25,26 @@ to_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
 # portal-contract fields plus grype/DB versions, and normalizes the DB build
 # time to descriptor.db.built (grype v6 nests it under db.status.built).
 #
-# Two lookups parameterize it. $av (distro fix availability) is always {}
-# here — the refresh does not run distro-fix-check.sh, so those fields are
-# null, the contract's "not judged". $vend is built per SBOM below:
-# artifact.vendored marks a bundled copy (setuptools/_vendor/), judged from
-# the SBOM's sourceInfo because grype reconstructs no locations from SPDX —
-# a version is vendored only when EVERY SBOM entry for it sits under
-# _vendor/, so a stale bundle next to a properly installed copy keeps the
-# real one actionable.
+# Three lookups parameterize it, and all three carry the "real but not
+# patchable in place" judgments the portal needs to decide what is actionable.
+# A refresh that dropped any of them would silently re-grade every image the
+# moment it replaced the build-time report — which is what happened while $av
+# was hardcoded to {} and $isfrozen did not exist here at all.
+#
+# $av  (fix.availableInDistro / distroLatest) comes from distro-fix-check.sh.
+#      grype matches Rocky/Alma against the RHEL feed, so it cites fixes that
+#      EL clones have not rebuilt yet; without this an image that is already
+#      fully upgraded is graded down for an upgrade nobody can perform.
+# $vend (artifact.vendored) marks a bundled copy (setuptools/_vendor/), judged
+#      from the SBOM's sourceInfo because grype reconstructs no locations from
+#      SPDX — a version is vendored only when EVERY SBOM entry for it sits
+#      under _vendor/, so a stale bundle next to a properly installed copy
+#      keeps the real one actionable.
+# $isfrozen / $frz (artifact.frozen) mark packages the image's upgrade-freeze
+#      policy pins in place: the fix exists, but applying it on a running node
+#      is unsupported, so the remediation is a rebuild. Per-repo policy, from
+#      bin/freeze-policy.json — the builders sharing this mirror do not have
+#      the same freeze list.
 VULN_PROJECT='{
   descriptor: {
     name: .descriptor.name, version: .descriptor.version,
@@ -55,18 +67,64 @@ VULN_PROJECT='{
       dataSource: .vulnerability.dataSource
     },
     artifact: {name: .artifact.name, version: .artifact.version, type: .artifact.type,
-      vendored: ($vend[.artifact.name + "|" + .artifact.version] // false)}
+      vendored: ($vend[.artifact.name + "|" + .artifact.version] // false),
+      frozen: (if $isfrozen then (.artifact.name | test($frz)) else false end)}
   }]
 }'
+
+BIN=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+POLICY="$BIN/freeze-policy.json"
+
+# One index cache for the whole run: ~150 SBOMs collapse to a couple of dozen
+# (family, release, arch) triples, and distro-fix-check.sh would otherwise
+# re-download a distro's entire package index per SBOM. Deliberately run-scoped
+# and thrown away — a persisted cache would answer "newest version the distro
+# publishes" from yesterday, which is the one thing it must not do.
+DFCACHE=$(mktemp -d "${TMPDIR:-/tmp}/dfcache.XXXXXX")
+export DISTRO_FIX_CACHE_DIR="$DFCACHE"
+trap 'rm -rf "$DFCACHE"' EXIT
+
+# Which arch is this image? The purl qualifiers carry it; the freeze/vendored
+# judgments do not care but distro-fix-check.sh does, since this job runs on an
+# x86_64 runner and half the mirrored SBOMs are aarch64. Majority wins because
+# noarch/all packages are excluded, not counted. Empty = let the script fall
+# back to uname.
+sbom_arch() {
+  jq -r '[.packages[]?.externalRefs[]? | select(.referenceType == "purl")
+          | .referenceLocator | select(test("[?&]arch="))
+          | capture("[?&]arch=(?<a>[^&]+)").a
+          | select(. == "x86_64" or . == "amd64" or . == "aarch64" or . == "arm64")]
+    | if length == 0 then "" else (group_by(.) | max_by(length) | .[0]) end' "$1" 2>/dev/null || echo ""
+}
 
 changed=0
 scanned=0
 db_date_seen=""
+policy_repo=""      # repo whose freeze policy is currently loaded
+frz='^$'            # FREEZE_PKG_REGEX in force — ^$ matches no package name
+marker=""           # FREEZE_MARKER_REGEX in force; empty = repo has no policy
 
 while IFS= read -r -d '' sbom; do
   scanned=$((scanned + 1))
   vuln="${sbom%.spdx.json}.vuln.json"
+  repo=$(basename "$(dirname "$sbom")")
   tmp=$(mktemp)
+
+  # Resolve the repo's freeze policy once per directory — find|sort groups the
+  # SBOMs by repo, so this runs a handful of times, not once per digest.
+  if [[ "$repo" != "$policy_repo" ]]; then
+    policy_repo="$repo"
+    # .repoRegex is bound before the pipe: inside `$r | test(...)` the input is
+    # already $r, so reading .repoRegex there would index a string.
+    marker=$(jq -r --arg r "$repo" \
+      'first(.policies[]? | .repoRegex as $re | select($r | test($re)) | .markerRegex) // ""' \
+      "$POLICY" 2>/dev/null || echo "")
+    frz=$(jq -r --arg r "$repo" \
+      'first(.policies[]? | .repoRegex as $re | select($r | test($re)) | .pkgRegex) // "^$"' \
+      "$POLICY" 2>/dev/null || echo '^$')
+    [[ -n "$frz" ]] || frz='^$'
+    log "${repo}: freeze policy $([[ -n "$marker" ]] && echo "loaded" || echo "none — frozen stays false")"
+  fi
 
   raw=$(mktemp)
   if ! grype "sbom:${sbom}" -o json > "$raw" 2>/dev/null; then
@@ -84,7 +142,21 @@ while IFS= read -r -d '' sbom; do
     | group_by(.k) | map({key: .[0].k, value: (map(.v) | all)}) | from_entries' "$sbom" 2>/dev/null || echo '{}')
   echo "$vend" | jq -e 'type == "object"' >/dev/null 2>&1 || vend='{}'
 
-  jq -c --argjson av '{}' --argjson vend "$vend" "$VULN_PROJECT" "$raw" > "$tmp"
+  # Is the fix grype cites actually published by this distro yet? Fails soft to
+  # {} — the fields then stay null, the contract's "not judged".
+  avail=$(DISTRO_FIX_ARCH="$(sbom_arch "$sbom")" "$BIN/distro-fix-check.sh" "$repo" "$raw" || echo '{}')
+  echo "$avail" | jq -e 'type == "object"' >/dev/null 2>&1 || avail='{}'
+
+  # Is this image under its repo's upgrade-freeze policy? Judged from the SBOM,
+  # since a digest carries no tag. Fails soft to false.
+  isfrozen=false
+  if [[ -n "$marker" ]]; then
+    isfrozen=$(jq --arg re "$marker" '[.packages[]?.name // empty] | any(test($re))' "$sbom" 2>/dev/null || echo false)
+    [[ "$isfrozen" == "true" ]] || isfrozen=false
+  fi
+
+  jq -c --argjson av "$avail" --argjson vend "$vend" \
+    --argjson isfrozen "$isfrozen" --arg frz "$frz" "$VULN_PROJECT" "$raw" > "$tmp"
   rm -f "$raw"
 
   new_built=$(db_built "$tmp")
@@ -105,7 +177,9 @@ while IFS= read -r -d '' sbom; do
 
   mv "$tmp" "$vuln"
   changed=$((changed + 1))
-  log "updated ${vuln} ($(jq '.matches | length' "$vuln") findings, DB ${new_built})"
+  log "updated ${vuln} ($(jq '.matches | length' "$vuln") findings, DB ${new_built}) — $(jq '
+    [.matches[] | select(.artifact.frozen)] | length' "$vuln") frozen, $(jq '
+    [.matches[] | select(.vulnerability.fix.availableInDistro == false)] | length' "$vuln") not yet in distro"
 done < <(find . -type f -name 'sha256-*.spdx.json' -print0 | sort -z)
 
 log "scanned ${scanned} SBOM(s), ${changed} report(s) changed"
