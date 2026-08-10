@@ -30,7 +30,7 @@ jobs:
       DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
     steps:
       - name: Checkout mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Prune orphaned SBOM/vuln reports
         env:

@@ -32,7 +32,7 @@ jobs:
       VULN_FORCE: ${{ github.event.inputs.vuln_force || 'false' }}
     steps:
       - name: Checkout mirror
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install pinned grype
         run: |
