@@ -49,6 +49,7 @@ live_digests_for_repo() {
 
 removed=0
 kept=0
+removed_paths=()   # replayed verbatim if the push races another pusher
 for dir in */; do
   repo="${dir%/}"
   ls "$repo"/sha256-*.spdx.json >/dev/null 2>&1 || continue
@@ -71,6 +72,7 @@ for dir in */; do
     else
       log "orphan: $f"
       [[ "$DRY_RUN" != "true" ]] && git rm -q "$f"
+      removed_paths+=("$f")
       removed=$((removed + 1))
     fi
   done
@@ -92,8 +94,33 @@ for attempt in 1 2 3; do
     log "pushed prune of ${removed} file(s)"
     exit 0
   fi
-  log "push failed (attempt ${attempt}/3) — rebasing and retrying"
-  git pull -q --rebase origin "$branch"
+  log "push failed (attempt ${attempt}/3) — replaying the deletions onto the new remote head"
+
+  # Deliberately NOT `git pull --rebase`. Four different actors push to this
+  # branch (both builder repos, the daily refresh, and humans merging PRs), so a
+  # rejected push is routine — and every file this job deletes is one a refresh
+  # or a PR may have just rewritten. Rebasing turns each of those into a
+  # modify/delete conflict, which no merge strategy resolves (-X ours/theirs
+  # apply to content conflicts only), leaving the runner stuck mid-rebase and
+  # the job dead. That is exactly how the 2026-08-10 run died against PR #1.
+  #
+  # The resolution is never in doubt: the digest is referenced by no live quay
+  # tag, and a fresher body for its report does not make it less orphaned. So
+  # drop the local commit and re-apply the same deletions on top of whatever
+  # landed. Deletions only — anything the other pusher ADDED is a different
+  # digest, hence a different file name, and survives untouched.
+  git fetch -q origin "$branch"
+  git reset -q --hard "origin/${branch}"
+  git rm -q --ignore-unmatch -- "${removed_paths[@]}"
+
+  # Recount rather than reusing $removed: a concurrent prune may have taken some
+  # of these already, and --ignore-unmatch makes that a no-op, not an error.
+  staged=$(git diff --cached --name-only | wc -l | tr -d ' ')
+  if [[ "$staged" -eq 0 ]]; then
+    log "another push already removed every orphan — nothing left to do"
+    exit 0
+  fi
+  git commit -q -m "Prune ${staged} orphaned report file(s) for retired image digests"
 done
 log "ERROR: failed to push after 3 attempts" >&2
 exit 1
