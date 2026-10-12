@@ -25,7 +25,7 @@ to_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
 # portal-contract fields plus grype/DB versions, and normalizes the DB build
 # time to descriptor.db.built (grype v6 nests it under db.status.built).
 #
-# Three lookups parameterize it, and all three carry the "real but not
+# Four lookups parameterize it, and all four carry the "real but not
 # patchable in place" judgments the portal needs to decide what is actionable.
 # A refresh that dropped any of them would silently re-grade every image the
 # moment it replaced the build-time report — which is what happened while $av
@@ -40,6 +40,17 @@ to_epoch() { date -d "$1" +%s 2>/dev/null || echo 0; }
 #      SPDX — a version is vendored only when EVERY SBOM entry for it sits
 #      under _vendor/, so a stale bundle next to a properly installed copy
 #      keeps the real one actionable.
+# $owned DROPS matches on a language package that an OS package owns (the pip
+#      metadata python3-urllib3.rpm installs). grype collapses such duplicates
+#      itself only when the owner's distro is on its hard-coded "comprehensive
+#      feed" list (redhat, ubuntu, debian, ...); an SPDX scan reconstructs
+#      Rocky/Alma as rockylinux/almalinux, which are not, so on EL clones the
+#      pypi copy is matched against GitHub's pip advisories and cites a fix
+#      (urllib3 2.8.0) that no dnf repo will ever ship — an actionable High no
+#      rebuild can clear. Judged from the SBOM's ownership-by-file-overlap
+#      relationships with grype's own rule (owner rpm/deb/apk, child not,
+#      versions agree with the epoch stripped) and, as for vendored, only when
+#      EVERY SBOM entry for that name+version is owned.
 # $isfrozen / $frz (artifact.frozen) mark packages the image's upgrade-freeze
 #      policy pins in place: the fix exists, but applying it on a running node
 #      is unsupported, so the remediation is a rebuild. Per-repo policy, from
@@ -54,8 +65,10 @@ VULN_PROJECT='{
       schemaVersion: (.descriptor.db.schemaVersion // .descriptor.db.status.schemaVersion)
     }
   },
-  matches: [.matches[] |
-    ($av[.artifact.name + "|" + ((.vulnerability.fix.versions // []) | join(","))]) as $d | {
+  matches: [.matches[]
+    | select((.artifact.type | IN("rpm", "deb", "apk"))
+             or (($owned[.artifact.name + "|" + .artifact.version] // false) | not))
+    | ($av[.artifact.name + "|" + ((.vulnerability.fix.versions // []) | join(","))]) as $d | {
     vulnerability: {
       id: .vulnerability.id, severity: .vulnerability.severity,
       fix: {
@@ -142,6 +155,29 @@ while IFS= read -r -d '' sbom; do
     | group_by(.k) | map({key: .[0].k, value: (map(.v) | all)}) | from_entries' "$sbom" 2>/dev/null || echo '{}')
   echo "$vend" | jq -e 'type == "object"' >/dev/null 2>&1 || vend='{}'
 
+  # name|version → "an OS package owns this" for the match filter (see
+  # VULN_PROJECT), judged from the SBOM's ownership-by-file-overlap
+  # relationships. Fails soft to {} — every finding is then kept, as before.
+  owned=$(jq -c '
+    def purl: ((.externalRefs // []) | map(select(.referenceType == "purl")) | .[0].referenceLocator) // "";
+    def os: (purl | test("^pkg:(rpm|deb|apk)/"));
+    def ver: (.versionInfo // "");
+    def noepoch: sub("^[0-9]+:"; "");
+    ((.packages // []) | INDEX(.SPDXID)) as $pkgs
+    | ([.relationships[]?
+         | select(.relationshipType == "OTHER" and ((.comment // "") | startswith("ownership-by-file-overlap")))
+         | $pkgs[.spdxElementId // ""] as $parent | $pkgs[.relatedSpdxElement // ""] as $child
+         | select($parent != null and $child != null and ($parent | os) and (($child | os) | not))
+         | select((($parent | ver | noepoch) | startswith($child | ver))
+                  or (($child | ver) | startswith($parent | ver | noepoch)))
+         | $child.SPDXID] | unique) as $owned
+    | [.packages[]? | select(os | not) | {k: (.name + "|" + ver), v: (.SPDXID | IN($owned[]))}]
+    | group_by(.k) | map({key: .[0].k, value: (map(.v) | all)}) | from_entries' "$sbom" 2>/dev/null || echo '{}')
+  echo "$owned" | jq -e 'type == "object"' >/dev/null 2>&1 || owned='{}'
+  dropped=$(jq --argjson owned "$owned" '[.matches[]
+    | select(((.artifact.type | IN("rpm", "deb", "apk")) | not)
+             and ($owned[.artifact.name + "|" + .artifact.version] // false))] | length' "$raw")
+
   # Is the fix grype cites actually published by this distro yet? Fails soft to
   # {} — the fields then stay null, the contract's "not judged".
   avail=$(DISTRO_FIX_ARCH="$(sbom_arch "$sbom")" "$BIN/distro-fix-check.sh" "$repo" "$raw" || echo '{}')
@@ -155,7 +191,7 @@ while IFS= read -r -d '' sbom; do
     [[ "$isfrozen" == "true" ]] || isfrozen=false
   fi
 
-  jq -c --argjson av "$avail" --argjson vend "$vend" \
+  jq -c --argjson av "$avail" --argjson vend "$vend" --argjson owned "$owned" \
     --argjson isfrozen "$isfrozen" --arg frz "$frz" "$VULN_PROJECT" "$raw" > "$tmp"
   rm -f "$raw"
 
@@ -179,7 +215,7 @@ while IFS= read -r -d '' sbom; do
   changed=$((changed + 1))
   log "updated ${vuln} ($(jq '.matches | length' "$vuln") findings, DB ${new_built}) — $(jq '
     [.matches[] | select(.artifact.frozen)] | length' "$vuln") frozen, $(jq '
-    [.matches[] | select(.vulnerability.fix.availableInDistro == false)] | length' "$vuln") not yet in distro"
+    [.matches[] | select(.vulnerability.fix.availableInDistro == false)] | length' "$vuln") not yet in distro, ${dropped} OS-owned dropped"
 done < <(find . -type f -name 'sha256-*.spdx.json' -print0 | sort -z)
 
 log "scanned ${scanned} SBOM(s), ${changed} report(s) changed"

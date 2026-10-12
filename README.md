@@ -45,8 +45,9 @@ Do not edit either file type manually.
 
 Three projected fields tell the portal that a finding is real but **not**
 patchable with a plain `dnf update` / `apt upgrade`, so it must not be counted
-as actionable. The daily re-scan has to reproduce all three, or it re-grades
-every image the moment it overwrites the build-time report:
+as actionable, and one filter drops findings that were never the image's to
+patch. The daily re-scan has to reproduce all four, or it re-grades every image
+the moment it overwrites the build-time report:
 
 - **`vulnerability.fix.availableInDistro`** / **`distroLatest`** — is the fix
   grype cites actually published by this distro yet? grype has no Rocky/Alma
@@ -63,6 +64,19 @@ every image the moment it overwrites the build-time report:
   path). Judged from the SBOM's `sourceInfo`, and only when *every* entry for
   that version is vendored, so a stale bundle beside a real install keeps the
   real one actionable.
+- **OS-owned language packages are dropped.** An RPM such as `python3-urllib3`
+  installs pip metadata that syft catalogs as a second, pypi-typed `urllib3`
+  package, linked to the RPM by an `ownership-by-file-overlap` relationship.
+  grype collapses that duplicate only for distros on its hard-coded
+  "comprehensive feed" list (redhat, ubuntu, debian, ...); an SPDX scan
+  reconstructs Rocky/Alma as `rockylinux`/`almalinux`, which are not on it, so
+  on EL clones the pypi copy was matched against GitHub's pip advisories and
+  cited a fix (`urllib3 2.8.0`) no dnf repo will ever ship — an actionable High
+  no rebuild could clear. The projection applies grype's own rule from the
+  SBOM's relationships (owner rpm/deb/apk, child not, versions agree with the
+  epoch stripped) and, as for `vendored`, only when *every* entry for that
+  name+version is owned. The distro feed stays the authority for the owning
+  package, as on RHEL and Ubuntu.
 - **`artifact.frozen`** — a package the image's upgrade-freeze policy pins in
   place. The fix may exist, but applying it on a running node is unsupported;
   the remediation is a rebuild. Policy lives in `bin/freeze-policy.json`, keyed
