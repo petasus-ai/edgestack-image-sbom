@@ -36,8 +36,13 @@ Reports are produced two ways, both applying the same newer-DB update gate:
   CI (`scripts/vuln-pipeline.sh`), right after the SBOM is published;
 - **daily** by this repo's `.github/workflows/refresh-vulns.yml`, which updates
   the grype DB, re-scans every `*.spdx.json`, and batches the newly-stale
-  reports into one commit. It is self-contained (no image/registry access) and
-  pushes with the built-in `GITHUB_TOKEN`.
+  reports into one commit. A re-scan takes ~100 s an SBOM, so the SBOMs are
+  split into parallel jobs of at most 30 (`bin/refresh-vulns.sh` with
+  `SHARD=i/n`, each job checking out only `bin/` and its repository) and one
+  last job commits what they rewrote (`bin/commit-reports.sh`); a single job
+  for the whole mirror ran ~5 h, against the 6 h job limit. It is
+  self-contained (no image/registry access) and pushes with the built-in
+  `GITHUB_TOKEN`.
 
 Do not edit either file type manually.
 
@@ -92,13 +97,25 @@ SBOMs are immutable, so a rebuilt tag moves to a new digest and the previous
 digest's files become orphans that would otherwise accumulate forever.
 `.github/workflows/prune-orphans.yml` (weekly + `workflow_dispatch`, with a
 `dry_run` input) runs `bin/prune-orphans.sh`, which lists each repository's
-active tags via the public quay API and removes the `.spdx.json`/`.vuln.json`
-of any digest no longer referenced by a live tag. This bounds both the working
-tree and the daily re-scan set to the digests currently on quay. It is safe by
-construction: if the quay API for a repository fails or returns no digests,
-that directory is skipped untouched, so a transient error can never delete
-valid files. It keeps any digest a live tag points at, regardless of which
-branch (master or cilium) built it.
+tags with their history via the public quay API and removes the
+`.spdx.json`/`.vuln.json` of any digest it does not keep:
+
+- every digest a live tag points at, regardless of which branch (master or
+  cilium) built it;
+- in VM image repositories (`*-container-disk`), also the build each live tag
+  pointed at just before (`KEEP_PREVIOUS=1`). Clusters keep running the build
+  they imported until they delete it, usually one back as their rollback, and
+  the Petasus catalog republishes that build's latest scan by digest so their
+  grade stays current. KaaS node images (`*-kube`) keep only their live tags.
+
+This bounds both the working tree and the daily re-scan set (about 200
+digests, plus some 50 previous VM image builds). It is safe by construction:
+if the quay API for a repository fails or returns no digests, that directory
+is skipped untouched, so a transient error can never delete valid files.
+
+Each kept report costs the repository's history about 100 kB a day (the daily
+rewrite, packed), so `KEEP_PREVIOUS` and `KEEP_PREVIOUS_REPOS` are the knobs
+for the re-scan time and the repository's growth.
 
 The two maintenance workflows share a `mirror-maintenance` concurrency group so
 the daily re-scan and the weekly prune never run against the tree at once.

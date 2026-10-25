@@ -1,8 +1,10 @@
 name: Prune orphaned reports
 
 # SBOMs are immutable, so every rebuild leaves the previous digest's files
-# behind. This keeps only the digests still referenced by a live quay tag,
-# bounding both the working tree and the daily re-scan set. Runs in this public
+# behind. This keeps only the digests still referenced by a live quay tag and,
+# for VM images (*-container-disk), the build each live tag pointed at just
+# before (bin/prune-orphans.sh KEEP_PREVIOUS), bounding both the working tree
+# and the daily re-scan set. Runs in this public
 # repo with the built-in GITHUB_TOKEN — no PAT.
 
 on:

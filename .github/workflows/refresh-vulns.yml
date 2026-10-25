@@ -5,6 +5,15 @@ name: Refresh vulnerability reports
 # grype DB and rewrites the .vuln.json reports whose DB is now newer. Runs in
 # this public repo, so Actions minutes are free, and pushes with the built-in
 # GITHUB_TOKEN — no PAT needed.
+#
+# A re-scan takes ~100 s an SBOM (grype plus the distro index checks), so one
+# job for the whole mirror (~180 SBOMs) ran ~5 h against the 6 h job limit,
+# and the mirror now also keeps each VM image tag's previous build
+# (bin/prune-orphans.sh). The SBOMs are therefore scanned in parallel jobs of
+# at most SHARD_SIZE each (a repository's SBOMs split by bin/refresh-vulns.sh
+# SHARD), each checking out only bin/ and its repository; every job hands back
+# the reports it rewrote, and one last job commits them together
+# (bin/commit-reports.sh).
 
 on:
   schedule:
@@ -24,15 +33,55 @@ concurrency:
   group: mirror-maintenance   # shared with prune-orphans so they never race
   cancel-in-progress: false
 
+env:
+  GRYPE_VERSION: "0.116.0"   # keep in sync with image-builder scripts/vuln-pipeline.sh
+  SHARD_SIZE: "30"           # SBOMs a scan job takes at most (~50 min)
+
 jobs:
-  refresh:
+  plan:
     runs-on: ubuntu-latest
-    env:
-      GRYPE_VERSION: "0.116.0"   # keep in sync with image-builder scripts/vuln-pipeline.sh
-      VULN_FORCE: ${{ github.event.inputs.vuln_force || 'false' }}
+    outputs:
+      shards: ${{ steps.plan.outputs.shards }}
     steps:
-      - name: Checkout mirror
+      - name: Checkout scripts only
         uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          sparse-checkout: bin
+
+      - name: Split the SBOMs into scan jobs
+        id: plan
+        run: |
+          shards=$(git ls-tree -r --name-only HEAD \
+            | grep -E '^[^/]+/sha256-[0-9a-f]{64}\.spdx\.json$' | cut -d/ -f1 | sort | uniq -c \
+            | jq -Rnc --argjson size "$SHARD_SIZE" '[inputs
+                | capture("^ *(?<n>[0-9]+) (?<dir>.+)$")
+                | (((.n | tonumber) + $size - 1) / $size | floor) as $of
+                | range(0; $of) as $i
+                | {dir, shard: "\($i)/\($of)", name: "\(.dir)-\($i)-\($of)"}]')
+          echo "shards=${shards}" >> "$GITHUB_OUTPUT"
+          echo "$shards" | jq -r '.[] | "\(.dir) \(.shard)"'
+
+  scan:
+    needs: plan
+    if: needs.plan.outputs.shards != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.shards) }}
+    env:
+      VULN_FORCE: ${{ github.event.inputs.vuln_force || 'false' }}
+      REPO_DIR: ${{ matrix.dir }}
+    steps:
+      - name: Checkout scripts and ${{ matrix.dir }}
+        uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          sparse-checkout: |
+            bin
+            ${{ matrix.dir }}
 
       - name: Install pinned grype
         run: |
@@ -43,7 +92,48 @@ jobs:
       - name: Update grype vulnerability DB
         run: grype db update
 
-      - name: Re-scan SBOMs and commit refreshed reports
+      - name: Re-scan ${{ matrix.dir }} (shard ${{ matrix.shard }})
         env:
-          RUN_COMMIT: "1"
-        run: bash bin/refresh-vulns.sh
+          SHARD: ${{ matrix.shard }}
+        run: bash bin/refresh-vulns.sh "$REPO_DIR"
+
+      - name: Gather the rewritten reports
+        run: |
+          mkdir -p "$RUNNER_TEMP/refreshed"
+          git ls-files -m -o --exclude-standard -- "$REPO_DIR/*.vuln.json" \
+            | while IFS= read -r f; do
+                mkdir -p "$RUNNER_TEMP/refreshed/$(dirname "$f")"
+                cp "$f" "$RUNNER_TEMP/refreshed/$f"
+              done
+          find "$RUNNER_TEMP/refreshed" -type f | wc -l | xargs echo "[refresh] reports handed back:"
+
+      - name: Hand them to the commit job
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.name }}
+          path: ${{ runner.temp }}/refreshed/
+          if-no-files-found: ignore
+          retention-days: 1
+
+  commit:
+    needs: [plan, scan]
+    # Commit what the jobs that finished rewrote, even when one of them failed.
+    if: ${{ !cancelled() && needs.plan.outputs.shards != '[]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout scripts only
+        uses: actions/checkout@v6
+        with:
+          filter: blob:none
+          sparse-checkout: bin
+
+      - name: Collect the rewritten reports
+        uses: actions/download-artifact@v4
+        continue-on-error: true   # no job rewrote anything: no artifacts
+        with:
+          pattern: reports-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/refreshed
+
+      - name: Commit refreshed reports
+        run: bash bin/commit-reports.sh "$RUNNER_TEMP/refreshed"

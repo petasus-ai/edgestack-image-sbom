@@ -9,11 +9,26 @@
 # VULN_FORCE=true rewrites unconditionally. All changes land in one commit.
 #
 # grype must be on PATH and its DB already updated (the workflow does both).
-# Committing/pushing is left to the workflow when RUN_COMMIT is unset; set
-# RUN_COMMIT=1 to have this script commit and push (used by the workflow).
+# Committing/pushing is left to the caller when RUN_COMMIT is unset; set
+# RUN_COMMIT=1 to have this script commit and push (a whole-mirror run by hand).
+#
+# Usage: bin/refresh-vulns.sh [<repository>...]   # every repository by default
+# Environment:
+#   SHARD=<i>/<n>   scan only every n-th SBOM of the repositories given,
+#                   starting at the i-th (0-based). The workflow splits the
+#                   ~100 s-a-SBOM re-scan into parallel jobs this way, since
+#                   one job for the whole mirror runs into the 6 h job limit;
+#                   each job hands its rewritten reports to bin/commit-reports.sh.
 set -euo pipefail
 
 VULN_FORCE="${VULN_FORCE:-false}"
+SHARD="${SHARD:-0/1}"
+[[ "$SHARD" =~ ^([0-9]+)/([1-9][0-9]*)$ ]] || { echo "[refresh] SHARD must read i/n" >&2; exit 2; }
+shard_i=${BASH_REMATCH[1]}
+shard_n=${BASH_REMATCH[2]}
+(( shard_i < shard_n )) || { echo "[refresh] SHARD ${SHARD}: i must be below n" >&2; exit 2; }
+roots=("$@")
+[[ ${#roots[@]} -gt 0 ]] || roots=(.)
 
 log() { echo "[refresh] $*"; }
 
@@ -112,12 +127,15 @@ sbom_arch() {
 
 changed=0
 scanned=0
+position=-1
 db_date_seen=""
 policy_repo=""      # repo whose freeze policy is currently loaded
 frz='^$'            # FREEZE_PKG_REGEX in force — ^$ matches no package name
 marker=""           # FREEZE_MARKER_REGEX in force; empty = repo has no policy
 
 while IFS= read -r -d '' sbom; do
+  position=$((position + 1))
+  (( position % shard_n == shard_i )) || continue
   scanned=$((scanned + 1))
   vuln="${sbom%.spdx.json}.vuln.json"
   repo=$(basename "$(dirname "$sbom")")
@@ -216,9 +234,9 @@ while IFS= read -r -d '' sbom; do
   log "updated ${vuln} ($(jq '.matches | length' "$vuln") findings, DB ${new_built}) — $(jq '
     [.matches[] | select(.artifact.frozen)] | length' "$vuln") frozen, $(jq '
     [.matches[] | select(.vulnerability.fix.availableInDistro == false)] | length' "$vuln") not yet in distro, ${dropped} OS-owned dropped"
-done < <(find . -type f -name 'sha256-*.spdx.json' -print0 | sort -z)
+done < <(find "${roots[@]}" -type f -name 'sha256-*.spdx.json' -print0 | sort -z)
 
-log "scanned ${scanned} SBOM(s), ${changed} report(s) changed"
+log "scanned ${scanned} SBOM(s) (shard ${SHARD} of ${roots[*]}), ${changed} report(s) changed"
 
 if [[ "${RUN_COMMIT:-0}" != "1" ]]; then
   exit 0
