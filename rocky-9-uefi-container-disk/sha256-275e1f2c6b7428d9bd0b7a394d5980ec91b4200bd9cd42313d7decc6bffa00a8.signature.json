@@ -1,0 +1,9 @@
+{
+  "signed": true,
+  "issuer": "https://token.actions.githubusercontent.com",
+  "identity": "Petasus AI Cloud build pipeline (GitHub Actions)",
+  "signedAt": "2026-10-31T14:40:50Z",
+  "tlogIndex": 3614300645,
+  "tlogID": "c0d23d6ad406973f9559f3ba2d1ca01f84147d8ffc5b8445c224f98b9591801d",
+  "digest": "sha256:275e1f2c6b7428d9bd0b7a394d5980ec91b4200bd9cd42313d7decc6bffa00a8"
+}
